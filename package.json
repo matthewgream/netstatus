@@ -1,0 +1,11 @@
+{
+    "name": "netstatus",
+    "version": "1.0.0",
+    "description": "poll the network's devices and publish their state to MQTT; and the port, PoE and wifi tools that share its code",
+    "private": true,
+    "license": "CC-BY-NC-SA-4.0",
+    "dependencies": {
+        "mqtt": "5.13.0",
+        "net-snmp": "3.26.0"
+    }
+}

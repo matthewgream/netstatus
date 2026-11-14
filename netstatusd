@@ -1,0 +1,165 @@
+#!/usr/bin/env node
+//
+// netstatusd -- poll the network's devices and publish their state to MQTT, for alerts.
+//
+// The alerting already exists: mqtt-watchdog turns JSON on MQTT into ntfy and email, with
+// hold times, reminders, recovery notices and per-entry arrays, and notices a topic that has
+// gone quiet. So this only polls and publishes. Every condition worth a notification (the
+// router on battery, a PoE port that stopped powering, a device gone missing) is a field in
+// the state below and a few lines of mqtt-watchdog config, not code here.
+//
+// Each round reads every configured device over SNMP (port-status.js's reader: system,
+// sensors, ports, PoE; no credentials, and SwOS answers too) and publishes one retained
+// message per device to <mqtt-topic>/<host>:
+//
+//   { "time": "2026-11-14 13:40:00", "host": "mh-rb960pgs", "label": "rbpro", "reachable": true,
+//     "board": "...", "version": "7.25.1", "firmware": "7.25.1", "uptime_s": 7322, "temperature": 33,
+//     "voltage": 23.9, "on_battery": false, "ports_up": 5, "poe_watts": 3.2,
+//     "ports": [ { "name": "uplink-annex", "link": "up", "speed_mbps": 1000,
+//                  "poe": "powered-on", "poe_watts": 3.2, "poe_fault": false }, ... ] }
+//
+// A device that does not answer is still published, as { ..., "reachable": false, "error" },
+// so the message stream itself only stops if netstatusd does: that is what a topic.N watch
+// in mqtt-watchdog catches. Fields that do not apply are left out rather than null (no
+// on_battery without a battery-<label> setting, no poe on a port without PoE), because a
+// field absent from a message leaves mqtt-watchdog's alert for it alone.
+//
+// Changes (reachable, on_battery, a port's link or PoE fault) are logged to the journal.
+//
+//   Usage:
+//     netstatusd [<config>]          poll forever (default config /etc/default/netstatus)
+//     netstatusd [<config>] --once   one round, printed as JSON rather than published
+//
+// Config: plain key=value, see netstatus.cfg.
+
+const fs = require('fs');
+const os = require('os');
+
+const args = process.argv.slice(2);
+const ONCE = args.includes('--once');
+const CFG_FILE = args.find((a) => !a.startsWith('--')) || '/etc/default/netstatus';
+const cfg = {};
+try {
+    for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
+        const m = /^\s*([a-z][a-z0-9-]*)\s*=\s*(.*?)\s*$/.exec(line);
+        if (m) cfg[m[1]] = m[2];
+    }
+} catch (e) {
+    console.error(`netstatusd: ${CFG_FILE}: ${e.message}`);
+    process.exit(1);
+}
+
+// port-status.js reads the community from the environment; set it before loading it.
+if (cfg['snmp-community']) process.env.POE_COMMUNITY = cfg['snmp-community'];
+const { readDevice } = require('./port-status.js');
+
+const BROKER = cfg['mqtt-server'] || 'mqtt://localhost';
+const TOPIC = cfg['mqtt-topic'] || 'network';
+const INTERVAL = (Number(cfg['interval']) || 30) * 1000;
+const DEVICES = Object.entries(cfg)
+    .filter(([k, v]) => k.startsWith('device-') && v)
+    .map(([k, v]) => ({ label: k.slice('device-'.length), host: v }));
+const BATTERY = Object.fromEntries(
+    Object.entries(cfg)
+        .filter(([k, v]) => k.startsWith('battery-') && !isNaN(Number(v)))
+        .map(([k, v]) => [k.slice('battery-'.length), Number(v)])
+);
+if (!DEVICES.length) {
+    console.error(`netstatusd: ${CFG_FILE}: no device-<label>=<host> lines`);
+    process.exit(1);
+}
+
+// mtxrPOEStatus codes that mean the port should be powering and is not (or is being refused):
+// everything but disabled (1), waiting/no-load (2), powered-on (3) and poe-in-detected (12).
+const POE_OK = new Set([1, 2, 3, 12]);
+
+const pad = (n) => String(n).padStart(2, '0');
+const localTime = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+function stateOf(dev, r) {
+    const volts = (r.volts || []).find((v) => v.name === 'voltage') || (r.volts || [])[0];
+    const s = {
+        time: localTime(),
+        host: dev.host,
+        label: dev.label,
+        reachable: true,
+        os: r.os,
+        board: r.board,
+        version: r.version,
+        ...(r.firmware ? { firmware: r.firmware, firmware_upgrade: r.firmwareUpgrade } : {}),
+        ...(r.uptime != null ? { uptime_s: Math.round(Number(r.uptime) / 100) } : {}),
+        ...(r.tempC != null ? { temperature: r.tempC } : {}),
+        ...(volts ? { voltage: volts.volts } : {}),
+        ...(volts && BATTERY[dev.label] != null ? { on_battery: volts.volts < BATTERY[dev.label] } : {}),
+        ports_up: r.portsUp,
+        ...(r.poePorts ? { poe_watts: r.poeW } : {}),
+        ports: r.ports.map((p) => ({
+            name: p.name,
+            ...(p.alias ? { alias: p.alias } : {}),
+            link: p.link,
+            ...(p.speedMbps ? { speed_mbps: p.speedMbps } : {}),
+            ...(p.poe ? { poe: p.poeStatus.label, ...(p.power_W != null ? { poe_watts: p.power_W } : {}), poe_fault: p.poeStatus.code != null && !POE_OK.has(p.poeStatus.code) } : {}),
+        })),
+    };
+    return s;
+}
+
+async function poll(dev) {
+    try {
+        return stateOf(dev, await readDevice(dev));
+    } catch (e) {
+        return { time: localTime(), host: dev.host, label: dev.label, reachable: false, error: e.message };
+    }
+}
+
+// What changed since the last round, for the journal.
+const last = {};
+function logChanges(s) {
+    const was = last[s.host];
+    last[s.host] = s;
+    if (!was) return console.log(`${s.label} (${s.host}): ${s.reachable ? `reachable${s.voltage != null ? `, ${s.voltage} V` : ''}${s.on_battery ? ', ON BATTERY' : ''}` : `UNREACHABLE: ${s.error}`}`);
+    if (was.reachable !== s.reachable) console.log(`${s.label}: ${s.reachable ? 'reachable again' : `UNREACHABLE: ${s.error}`}`);
+    if (!s.reachable || !was.reachable) return;
+    if (was.on_battery !== s.on_battery && s.on_battery != null) console.log(`${s.label}: ${s.on_battery ? 'ON BATTERY' : 'on mains'} (${s.voltage} V)`);
+    const before = Object.fromEntries((was.ports || []).map((p) => [p.name, p]));
+    for (const p of s.ports) {
+        const b = before[p.name];
+        if (!b) continue;
+        if (b.link !== p.link) console.log(`${s.label} ${p.name}: link ${b.link} -> ${p.link}`);
+        if (b.poe !== p.poe && p.poe != null) console.log(`${s.label} ${p.name}: PoE ${b.poe} -> ${p.poe}${p.poe_fault ? ' (FAULT)' : ''}`);
+    }
+}
+
+async function round() {
+    return Promise.all(DEVICES.map(poll));
+}
+
+async function main() {
+    if (ONCE) {
+        console.log(JSON.stringify(await round(), null, 2));
+        process.exit(0);
+    }
+    const mqtt = require('mqtt');
+    const client = mqtt.connect(BROKER, { clientId: `netstatusd-${os.hostname()}-${process.pid}`, reconnectPeriod: 5000 });
+    client.on('connect', () => console.log(`netstatusd: connected to ${BROKER}, publishing ${TOPIC}/<host> every ${INTERVAL / 1000}s for ${DEVICES.map((d) => d.label).join(', ')}`));
+    client.on('error', (e) => console.error(`netstatusd: mqtt: ${e.message}`));
+    const stop = () => client.end(false, {}, () => process.exit(0));
+    process.on('SIGTERM', stop);
+    process.on('SIGINT', stop);
+
+    // One round at a time: the next starts INTERVAL after this one began, or straight after it
+    // ends if it overran (an unreachable device takes its full timeout).
+    for (;;) {
+        const started = Date.now();
+        for (const s of await round()) {
+            logChanges(s);
+            if (client.connected) client.publish(`${TOPIC}/${s.host}`, JSON.stringify(s), { retain: true, qos: 0 });
+        }
+        await new Promise((r) => setTimeout(r, Math.max(1000, INTERVAL - (Date.now() - started))));
+    }
+}
+
+main().catch((e) => {
+    console.error(`netstatusd: ${e.stack || e.message}`);
+    process.exit(1);
+});

@@ -1,0 +1,7 @@
+# per-host configs stay local, as for the other tools
+netstatus.*.cfg
+node_modules/
+# wifi-channel.js's record of what the last apply replaced, for its revert: state, not source
+.wifi-channel-backup.json
+# wifi-edimax.js's SSH askpass helper, present only while it runs
+.askpass-edimax.sh

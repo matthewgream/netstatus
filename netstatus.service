@@ -1,0 +1,19 @@
+[Unit]
+Description=netstatus - poll the network's devices and publish their state to MQTT
+Documentation=file:/opt/netstatus/README.md
+Wants=network-online.target
+After=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/netstatusd /etc/default/netstatus
+Restart=on-failure
+RestartSec=30s
+MemoryMax=200M
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
